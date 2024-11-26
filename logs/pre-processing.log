@@ -1,0 +1,12 @@
+2024-11-26 15:33:55 INFO:All tokenizers initialized successfully.
+2024-11-26 15:33:55 INFO:Using a maximum token limit of 512 tokens per chunk.
+2024-11-26 15:33:55 INFO:Found 1 JSON files in the directory data-bin.
+2024-11-26 15:33:55 INFO:Processing file: data-bin/dummy.json
+2024-11-26 15:33:55 INFO:Total text entries in data-bin/dummy.json: 120
+2024-11-26 15:33:59 INFO:Processing split 'train' with 168 chunks.
+2024-11-26 15:34:09 INFO:Saved 168 valid train features to data-bin/parsed/train/dummy_train.pt
+2024-11-26 15:34:09 INFO:Processing split 'dev' with 28 chunks.
+2024-11-26 15:34:12 INFO:Saved 28 valid dev features to data-bin/parsed/dev/dummy_dev.pt
+2024-11-26 15:34:12 INFO:Processing split 'test' with 20 chunks.
+2024-11-26 15:34:13 INFO:Saved 20 valid test features to data-bin/parsed/test/dummy_test.pt
+2024-11-26 15:34:13 INFO:All files have been processed successfully.

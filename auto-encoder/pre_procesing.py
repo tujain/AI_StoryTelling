@@ -441,7 +441,7 @@ def main():
         format='%(asctime)s %(levelname)s:%(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
         handlers=[
-            logging.FileHandler("processing.log"),
+            logging.FileHandler("logs/pre-processing.log"),
             logging.StreamHandler()
         ]
     )
