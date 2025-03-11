@@ -1,135 +1,151 @@
 import argparse
-import pdb
 import json
-import subprocess as sp
 import os
 import torch
-from tqdm import tqdm
-from transformers import GPT2Tokenizer
-from transformers import BertTokenizer
-from functools import partial
-import random
 import numpy as np
-from multiprocessing import Pool
-import re
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from transformers import AutoTokenizer
+import logging
+
+# Setup logging
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    filename=os.path.join('logs', 'pre_processing.log'),
+    filemode='w',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.DEBUG
+)
 
 class Feature:
-    def __init__(self, bert_ids=None, gpt2_ids=None, raw_text=None, cond=None):
-        self.bert_ids = bert_ids
-        self.gpt2_ids = gpt2_ids
+    def __init__(self, encoder_ids=None, decoder_ids=None, raw_text=None, cond=None):
+        self.encoder_ids = encoder_ids
+        self.decoder_ids = decoder_ids
         self.raw_text = raw_text
         self.cond = cond
 
-bert_toker = BertTokenizer.from_pretrained('bert-base-uncased')
-gpt2_toker = GPT2Tokenizer.from_pretrained('gpt2')
-
+# Define the data split ratio
 split_ratio = {"train": 0.8, "dev": 0.1, "test": 0.1}
 
-def get_sliding_features(text, maxlen, stride=None):
+def load_tokenizer(model_name, hf_token=None):
+    """Load tokenizer safely with error handling."""
+    try:
+        return AutoTokenizer.from_pretrained(model_name, token=hf_token if hf_token else None)
+    except Exception as e:
+        logging.error(f"Error loading tokenizer {model_name}: {e}")
+        raise RuntimeError(f"Failed to load tokenizer {model_name}")
+
+def get_feature(text, maxlen, encoder_toker, decoder_toker):
     """
-    Given a long text input, this function:
-    1. Encodes it using BERT and GPT-2 tokenizers.
-    2. Splits the tokenized sequences into multiple windows of size maxlen.
-    3. Returns a list of Feature objects.
-
-    stride: how far to move the window each step. If stride = maxlen, no overlap.
-    If stride < maxlen, you'll get overlapping windows.
+    Tokenizes a single line of text using the provided encoder and decoder tokenizers.
     """
-    if stride is None:
-        stride = maxlen  # no overlap by default
+    try:
+        raw_text = text.strip()
+        if not raw_text:
+            return None
 
-    raw_text = text.strip()
-    bert_ids_full = bert_toker.encode(raw_text)
-    gpt2_ids_full = gpt2_toker.encode(raw_text)
+        # Tokenize
+        enc_full = encoder_toker.encode(raw_text, add_special_tokens=True)[:maxlen]
+        dec_full = decoder_toker.encode(raw_text, add_special_tokens=True)[:maxlen]
 
-    features = []
-    start = 0
-    # Slide over the tokenized inputs
-    while start < len(bert_ids_full) and start < len(gpt2_ids_full):
-        # End index for this window
-        end = start + maxlen
-        b_chunk = bert_ids_full[start:end]
-        g_chunk = gpt2_ids_full[start:end]
+        return vars(Feature(encoder_ids=enc_full, decoder_ids=dec_full, raw_text=raw_text))
+    except Exception as e:
+        logging.error(f"Error processing text: {e}")
+        return None
 
-        if len(b_chunk) == 0 or len(g_chunk) == 0:
-            break
+def load_texts_from_ndjson(file):
+    """
+    Reads NDJSON file and extracts the "text" field from each line,
+    skipping empty lines or invalid JSON entries.
+    """
+    texts = []
+    try:
+        with open(file, "r", encoding="utf-8") as reader:
+            for line in reader:
+                line = line.strip()  # Remove leading/trailing whitespace
+                if not line:  # Skip empty lines
+                    continue
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict) and "text" in data:
+                        texts.append(data["text"])
+                except json.JSONDecodeError as e:
+                    logging.error(f"Skipping invalid JSON line in {file}: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error reading {file}: {e}")
 
-        feature = vars(Feature(b_chunk, g_chunk, raw_text))
-        features.append(feature)
-        start += stride
-
-    return features
+    return texts if texts else None
 
 def distributed_main(args):
+    """Main function to process text and save as `.pt` files."""
+    
+    # Load Tokenizers
+    encoder_toker = load_tokenizer(args.encoder_model, args.hf_token)
+    decoder_toker = load_tokenizer(args.decoder_model, args.hf_token)
+
+    # Get all NDJSON files from the corpus directory
     files = [os.path.join(args.corpus, fname) for fname in os.listdir(args.corpus) if fname.endswith('.json')]
-    pool = Pool()
+    logging.info(f"Found {len(files)} JSON files in corpus.")
 
-    for file in tqdm(files, total=len(files)):
-        print(f"Processing {file}")
-        with open(file, "r", encoding="utf-8") as reader:
-            chunk = []
-            block = []
-            for line in reader:
-                parsed_line = json.loads(line)
-                text = parsed_line['text']
+    # Optimize multiprocessing: Use available CPU cores but limit to 8 max
+    num_cores = min(cpu_count(), 8)
+    logging.info(f"Using {num_cores} CPU cores for multiprocessing.")
 
-                if not text.strip():
-                    if block:
-                        chunk.append(block)
-                        block = []
-                else:
-                    block.append(text)
-            # save last chunk
-            if block:
-                chunk.append(block)
-            
-            if chunk:
-                # Taking only the first chunk as in original code
-                data = chunk[0]
-                np.random.shuffle(data)
+    # Use multiprocessing for efficiency
+    with Pool(processes=num_cores) as pool:
+        for file in tqdm(files, total=len(files)):
+            logging.info(f"Processing {file}")
 
-                # Calculate the split indices
-                train_split = int(split_ratio["train"] * len(data))
-                dev_split = train_split + int(split_ratio["dev"] * len(data))
+            texts = load_texts_from_ndjson(file)
+            if texts is None:
+                continue  # Skip to next file if parsing failed
 
-                dataset = {}
-                dataset["train"] = data[:train_split]
-                dataset["dev"] = data[train_split:dev_split]
-                dataset["test"] = data[dev_split:]
+            np.random.shuffle(texts)
+            total = len(texts)
+            logging.info(f"Total texts in {file}: {total}")
+
+            # Data splits
+            train_split = int(split_ratio["train"] * total)
+            dev_split = train_split + int(split_ratio["dev"] * total)
+            dataset = {
+                "train": texts[:train_split],
+                "dev": texts[train_split:dev_split],
+                "test": texts[dev_split:]
+            }
+
+            for split_name, split_texts in dataset.items():
+                if not split_texts:
+                    logging.info(f"No data for split: {split_name} in {file}.")
+                    continue
+
+                logging.info(f"Processing {len(split_texts)} texts for split: {split_name}.")
                 
-                for split_name in split_ratio.keys():
-                    if len(dataset[split_name]) != 0:
-                        # Instead of directly calling get_feature on each line,
-                        # we now first convert each line to multiple features via sliding window
-                        all_features = []
-                        for text_line in dataset[split_name]:
-                            # Generate multiple features for each long line
-                            sliding_feats = get_sliding_features(text_line, args.maxlen)
-                            all_features.extend(sliding_feats)
+                # Apply multiprocessing tokenization
+                features = pool.map(
+                    partial(get_feature, maxlen=args.maxlen, encoder_toker=encoder_toker, decoder_toker=decoder_toker),
+                    split_texts,
+                    chunksize=max(1, len(split_texts) // num_cores)
+                )
 
-                        # Now we have a flattened list of features from all lines
-                        # pool.map is not needed for tokenization if we already did it above,
-                        # but if we wanted to still use parallelization for some reason, we can.
-                        # Here, all_features are already processed, so we can directly save them.
-                        
-                        # Make sure directories exist
-                        parsed_dir = os.path.join(os.path.dirname(file), 'parsed', split_name)
-                        if not os.path.exists(parsed_dir):
-                            os.makedirs(parsed_dir)
-                        
-                        # Save the preprocessed features
-                        torch.save(all_features, os.path.join(parsed_dir, f'{os.path.basename(file)[:-5]}_{split_name}.pt'))
-
-    pool.close()
-    pool.join()
+                # Remove None values
+                features = [f for f in features if f is not None]
+                output_dir = os.path.join(os.path.dirname(file), 'parsed', split_name)
+                os.makedirs(output_dir, exist_ok=True)
+                output_file = os.path.join(output_dir, f"{os.path.basename(file)[:-5]}_{split_name}.pt")
+                torch.save(features, output_file)
+                logging.info(f"Saved {len(features)} features for split '{split_name}' to {output_file}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--corpus', required=True,
-                        help='directory of training corpus')
-    parser.add_argument('--maxlen', type=int, default=256,
-                        help='maximum length of the sequence for each window')
+    parser.add_argument('--corpus', required=True, help='Directory containing training corpus JSON files')
+    parser.add_argument('--maxlen', type=int, default=256, help='Maximum token length for each sequence')
+    parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face access token')
+    parser.add_argument('--encoder_model', required=True, help='Name of the encoder model')
+    parser.add_argument('--decoder_model', required=True, help='Name of the decoder model')
     args = parser.parse_args()
 
     if os.path.isdir(args.corpus):
         distributed_main(args)
+    else:
+        logging.error("Corpus directory does not exist.")
